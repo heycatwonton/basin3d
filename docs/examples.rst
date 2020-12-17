@@ -20,13 +20,13 @@ Register all loaded plugins. See synthesizer documentation to register specific 
 
 Get timeseries data for the specified locations, variables, and time period (see below for required and optional arguments).
 
->>> usgs_df, usgs_metadata = synthesis.get_timeseries_data(synthesizer, monitoring_features=['USGS-09110000'],
+>>> usgs_data = synthesis.get_timeseries_data(synthesizer, monitoring_features=['USGS-09110000'],
 ...    observed_property_variables=['RDC','WT'], start_date='2019-10-25', end_date='2019-10-30')
 
 | The timeseries data is synthesized into a pandas dataframe with the timestamps as the index and as a pandas timedate class in the first column.
 | The data column names have the format <location_id>__<variable_id> (2 underscores separate the values).
 
->>> usgs_df
+>>> usgs_data.data
             TIMESTAMP  USGS-09110000__WT  USGS-09110000__RDC
 2019-10-25 2019-10-25                3.2            4.247527
 2019-10-26 2019-10-26                4.1            4.219210
@@ -38,7 +38,7 @@ Get timeseries data for the specified locations, variables, and time period (see
 | A dictionary containing metadata for each data column is also returned.
 | The column names are the keys. The dictionary values are a dictionary of the following fields:
 
->>> for k, v in usgs_metadata['USGS-09110000__WT'].items():
+>>> for k, v in usgs_data.metadata_store['USGS-09110000__WT'].items():
 ...     print(f'{k} = {v}')
 data_start = 2019-10-25 00:00:00
 data_end = 2019-10-30 00:00:00
@@ -51,8 +51,15 @@ temporal_aggregation = DAY
 quality = CHECKED
 sampling_medium = WATER
 sampling_feature_id = USGS-09110000
+sampling_feature_name = TAYLOR RIVER AT ALMONT, CO.
 datasource = USGS
 datasource_variable = 00010
+sampling_feature_lat = 38.66443715
+sampling_feature_long = -106.8453172
+sampling_feature_lat_long_datum = NAD83
+sampling_feature_altitude = 8010.76
+sampling_feature_alt_units = None
+sampling_feature_alt_datum = NGVD29
 
 :emphasis:`Note: Currently units are passed from the data source.`
 
