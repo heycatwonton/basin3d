@@ -252,10 +252,13 @@ USGS-09129550 - CRAWFORD RESERVOIR NEAR CRAWFORD, CO: [(-107.6061688, 38.6913766
 USGS-09129600 - SMITH FORK NEAR LAZEAR, CO: [(-107.7101389, 38.70744444)]
 USGS-383103106594200 - GUNNISON RIVER AT CNTY RD 32 BELOW GUNNISON, CO: [(-106.99545, 38.51725556)]
 
-..
-    Once bug is fixed, add this back in
-    A single monitoring feature object can be specified using the id parameter:
+A single monitoring feature object can be specified using the id parameter:
 
-    >>> mf = synthesizer.monitoring_features(id='USGS-1402')
-    >>> print(f"{mf.id} - {mf.description}")
-    USGS-1402 - SUBREGION: Gunnison
+>>> mf = synthesizer.monitoring_features(id='USGS-1402')
+>>> print(f"{mf.id} - {mf.description}")
+USGS-1402 - SUBREGION: Gunnison
+
+For the USGS plugin, if the monitoring feature desired is a point, specify feature_type = POINT:
+>>> mf = synthesizer.monitoring_features(id='USGS-09129600', feature_type='POINT')
+>>> print(f"{mf.id} - {mf.name}")
+USGS-09129600 - SMITH FORK NEAR LAZEAR, CO
