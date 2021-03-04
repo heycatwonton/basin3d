@@ -38,7 +38,7 @@ Get timeseries data for the specified locations, variables, and time period (see
 | A dictionary containing metadata for each data column is also returned.
 | The column names are the keys. The dictionary values are a dictionary of the following fields:
 
->>> for k, v in usgs_data.metadata_store['USGS-09110000__WT'].items():
+>>> for k, v in usgs_data.metadata['USGS-09110000__WT'].items():
 ...     print(f'{k} = {v}')
 data_start = 2019-10-25 00:00:00
 data_end = 2019-10-30 00:00:00

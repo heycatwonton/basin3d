@@ -19,18 +19,21 @@
 import datetime as dt
 import json
 import os
-import pandas as pd
+import shutil
 import tempfile
-
 from dataclasses import dataclass
+from enum import Enum
 from importlib import import_module
-from typing import Iterator, List, Union, cast, Tuple
+from typing import Generator, Iterator, List, Union, cast
+
+import h5py
+import pandas as pd
 
 from basin3d.core.catalog import CatalogTinyDb
-from basin3d.core.models import DataSource, MonitoringFeature, MeasurementTimeseriesTVPObservation, TimeMetadataMixin
+from basin3d.core.models import DataSource, MeasurementTimeseriesTVPObservation, MonitoringFeature, TimeMetadataMixin
 from basin3d.core.plugin import PluginMount
-from basin3d.core.synthesis import MeasurementTimeseriesTVPObservationAccess, MonitoringFeatureAccess, logger, \
-    QUERY_PARAM_MONITORING_FEATURES, QUERY_PARAM_OBSERVED_PROPERTY_VARIABLES, QUERY_PARAM_START_DATE
+from basin3d.core.synthesis import MeasurementTimeseriesTVPObservationAccess, MonitoringFeatureAccess, \
+    QUERY_PARAM_MONITORING_FEATURES, QUERY_PARAM_OBSERVED_PROPERTY_VARIABLES, QUERY_PARAM_START_DATE, logger
 from basin3d.core.types import TimeFrequency
 
 
@@ -39,17 +42,123 @@ class SynthesisException(Exception):
     pass
 
 
+class TimeseriesOutputType(Enum):
+    """Enumeration of synthesized time series output types"""
+
+    PANDAS = 0
+    HDF = 1
+    JSON = 2
+
+
+@dataclass
+class QueryInfo:
+    """
+    basin3d query information.
+    """
+
+    """The start time of the basin3d query"""
+    start_time: dt.datetime
+
+    """The end time of the successful completion of a basin3d query"""
+    end_time: Union[dt.datetime, None]
+
+    """The query parameters of the basin3d query"""
+    parameters: dict
+
+
 @dataclass
 class SynthesizedTimeseriesData:
     """
     Class for the return from get_timeseries_data function
     See get_timeseries_data for additional details on fields
     """
-    data: Union[pd.DataFrame, None]
-    metadata_store: dict
-    metadata_dataframe: Union[pd.DataFrame, None]
-    synthesized_var_with_records: list
-    synthesized_var_no_records: list
+
+    """The time series data"""
+    data: pd.DataFrame
+
+    """Metadata for the observations that have data"""
+    metadata: pd.DataFrame
+
+    """Metadata for the observations that have **no** data"""
+    metadata_no_observations: pd.DataFrame
+
+    """The file path where the output data was saved, if exists"""
+    output_path: Union[str, None]
+
+    """Time series synthesis query information"""
+    query: QueryInfo
+
+    @property
+    def variables(self) -> list:
+        """List of synthesized variable names with recorded observations"""
+        return []
+
+    @property
+    def variables_no_observations(self) -> list:
+        """List of synthesized variable names with **no** recorded observations"""
+        return []
+
+
+@dataclass
+class PandasTimeseriesData(SynthesizedTimeseriesData):
+    """
+    Class for Pandas time series data
+    """
+
+    @property
+    def variables(self) -> list:
+        """List of synthesized variable names with recorded observations"""
+        return [c for c in self.metadata.columns if c != 'TIMESTAMP']
+
+    @property
+    def variables_no_observations(self) -> list:
+        """List of synthesized variable names with **no** recorded observations"""
+        return [c for c in self.metadata_no_observations.columns if c != 'TIMESTAMP']
+
+
+@dataclass(init=False)
+class HDFTimeseriesData(SynthesizedTimeseriesData):
+    """
+    Class for hdf time series data
+    """
+    hdf: h5py.File
+
+    def __init__(self, hdf: h5py.File, output_path: str, query: QueryInfo):
+        """
+        Time Series data stored as HDF files.
+
+        :param hdf: The hdf timeseries dafile
+        :param output_path:
+        :param query:
+        """
+        self.hdf = hdf
+        self.output_path = output_path
+        self.query = query
+
+    @property
+    def data(self) -> pd.DataFrame:
+        """The time series data as a pandas dataframe"""
+        return pd.read_hdf(self.hdf.filename, key='data')
+
+    @property
+    def metadata(self) -> pd.DataFrame:
+        """Metadata for the observations that have data"""
+        return pd.read_hdf(self.hdf.filename, key='metadata').T
+
+    @property
+    def metadata_no_observations(self) -> pd.DataFrame:
+        """Metadata for the observations that have **no** data"""
+        return pd.read_hdf(self.hdf.filename, key='metadata_no_observations').T
+
+    @property
+    def variables(self) -> list:
+        """List of synthesized variable names with recorded observations"""
+        return [c for c in self.hdf['metadata'].attrs['column_names'] if c != 'TIMESTAMP']
+
+    @property
+    def variables_no_observations(self) -> list:
+        """List of synthesized variable names with **no** recorded observations"""
+        return [c for c in self.hdf['metadata_no_observations'].attrs['column_names'] if c != 'TIMESTAMP']
 
 
 def register(plugins: List[str] = None):
@@ -251,7 +360,10 @@ class DataSynthesizer:
 
 
 def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = True,
-                        temporal_resolution: str = 'DAY', **kwargs) -> SynthesizedTimeseriesData:
+                        temporal_resolution: str = 'DAY',
+                        output_path: str = None, output_name: str = None, cleanup: bool = True,
+                        output_type: TimeseriesOutputType = TimeseriesOutputType.PANDAS,
+                        **kwargs) -> SynthesizedTimeseriesData:
     """
 
     Wrapper for *DataSynthesizer.get_data* for timeseries data types. Currently only *MeasurementTimeseriesTVPObservations* are supported.
@@ -260,8 +372,8 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
     >>> from basin3d import synthesis
     >>> synthesizer = synthesis.register()
     >>> usgs_data = synthesis.get_timeseries_data( \
-        synthesizer, monitoring_features=['USGS-09110000'], \
-        observed_property_variables=['RDC','WT'], start_date='2019-10-25', end_date='2019-10-30')
+        synthesizer,monitoring_features=['USGS-09110000'], \
+        observed_property_variables=['RDC','WT'],start_date='2019-10-25',end_date='2019-10-30')
     >>> usgs_data.data
                 TIMESTAMP  USGS-09110000__WT  USGS-09110000__RDC
     2019-10-25 2019-10-25                3.2            4.247527
@@ -271,7 +383,7 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
     2019-10-29 2019-10-29                2.2            4.219210
     2019-10-30 2019-10-30                0.5            4.247527
 
-    >>> for k, v in usgs_data.metadata_store['USGS-09110000__WT'].items():
+    >>> for k, v in usgs_data.metadata['USGS-09110000__WT'].items():
     ...     print(f'{k} = {v}')
     data_start = 2019-10-25 00:00:00
     data_end = 2019-10-30 00:00:00
@@ -297,6 +409,11 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
     :param synthesizer: DataSnythesizer object
     :param location_lat_long: boolean: True = look for lat, long, elev coordinates and return in the metadata, False = ignore
     :param temporal_resolution: temporal resolution of output (in future, we can be smarter about this, e.g., detect it from the results or average higher frequency data)
+    :param output_path: directory to place any output/intermediate data.  if None, will create a temporary path.
+    :param output_name: name to give output file and/or intermediate directory. if None, output name will be timestamp (%Y%m%dT%H%M%S)
+    :param cleanup: if True, this will remove intermediate data generated
+    :param output_type: format for output data
+
     :param kwargs:
            Required parameters for a MeasurementTimeseriesTVPObservation:
                * monitoring_features
@@ -308,13 +425,20 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
                * result_quality
                * datasource
     :return: SynthesizedTimeseriesData object that contains:
+            output_path: The file path where the output data was saved, if exists
+            query_info: Time series synthesis query information
             data: pandas dataframe
             * TIMESTAMP column: datetime, repr as ISO format
             * data columns: column name format = f'{monitoring_feature_id}__{observed_property_variable_id}'
-            metadata_store: dictionary
-            all monitoring features are included regardless of whether data exists for the monitoring feature
-            * key = f'{monitoring_feature_id}__{observed_property_variable_id}'
-            * value = {
+              all monitoring features are included regardless of whether data exists for the monitoring feature
+            variables: list of location - variables combos that have data records
+            variables_no_observations: list of location - variable combos without data records
+            metadata: Metadata for the observations that have data
+            metadata_no_observations: Metadata for the observations that have **no** data
+
+            **Metadata Structure**
+            * index = f'{monitoring_feature_id}__{observed_property_variable_id}'
+            * columns = {
                 data_start = str
                 data_end = str
                 records = int
@@ -336,12 +460,9 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
                 sampling_feature_altitude = str
                 sampling_feature_alt_units = str
                 sampling_feature_alt_datum = str}
-
-            metadata_dataframe: pandas dataframe for data in dataframe
-            ** columns match dataframe and rows include elements of metadata_store: key, keys of value
-            synthesized_var_with_records: list of location - variables combos that have data records
-            synthesized_var_no_records: list of location - variable combos without data records
+            ** columns match `data` dataframe and rows include elements of metadata dataframes: key, keys of value
     """
+
     # Check that required parameters are provided. May have to rethink this when we expand to mulitple observation types
     if not all([QUERY_PARAM_MONITORING_FEATURES in kwargs, QUERY_PARAM_OBSERVED_PROPERTY_VARIABLES in kwargs,
                 QUERY_PARAM_START_DATE in kwargs]):
@@ -354,16 +475,39 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
     kwargs['aggregation_duration'] = temporal_resolution
 
     # Get the data
+    query_info = QueryInfo(dt.datetime.now(), None, kwargs)
     data_generator = synthesizer.measurement_timeseries_tvp_observations(**kwargs)
+    query_info.end_time = dt.datetime.now()
 
+    # Store for all variable metadata
     metadata_store = {}
-    first_timestamp = dt.datetime.now()
+
+    # data start and end dates for all results
+    first_timestamp = query_info.start_time
     last_timestamp = dt.datetime(1990, 1, 1)
     has_results = False
 
-    # By using the temporary directory, all the files are eventually removed when the directory is removed.
-    with tempfile.TemporaryDirectory() as temp_wd:
+    # Prepare working directory
+    working_directory: str = ""
+    if output_path:
+        if not os.path.exists(output_path):
+            raise SynthesisException(f"Specified output directory '{output_path}' does not exist.")
 
+        working_directory = output_path
+    else:
+        working_directory = tempfile.mkdtemp()
+
+    # Prepare directory for raw output from basin3d
+    output_name = output_name or query_info.start_time.strftime("%Y%m%dT%H%M%S")
+    intermediate_directory = os.path.join(working_directory, output_name)
+    os.mkdir(intermediate_directory)
+
+    output: SynthesizedTimeseriesData = SynthesizedTimeseriesData(data=None, metadata_no_observations=None,
+                                                                  metadata=None,
+                                                                  output_path=not cleanup and working_directory or output_path,
+                                                                  query=query_info)
+    try:
+        # if using the temporary directory, all the files are eventually removed when the directory is removed.
         for data_obj in data_generator:
 
             # Collect stats
@@ -447,7 +591,7 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
             has_results = True
 
             # Write results to temp file
-            with open(os.path.join(temp_wd, f'{synthesized_variable_name}.json'), mode='w') as f:
+            with open(os.path.join(intermediate_directory, f'{synthesized_variable_name}.json'), mode='w') as f:
                 f.write('{')
                 f.write(f'"{results[0][0]}": {results[0][1]}')
                 for result in results[1:]:
@@ -455,54 +599,195 @@ def get_timeseries_data(synthesizer: DataSynthesizer, location_lat_long: bool = 
                 f.write('}')
 
         if not has_results:
-            return SynthesizedTimeseriesData(None, metadata_store, None, [], [])
+            return output
 
-        # Prep the data dataframe
-        time_index = pd.date_range(first_timestamp, last_timestamp,
-                                   freq=TimeFrequency.PANDAS_FREQUENCY_MAP[temporal_resolution])
-        time_series = pd.Series(time_index, index=time_index)
-        output_df = pd.DataFrame({'TIMESTAMP': time_series})
-        # ToDo: expand to have TIMESTAMP_START and TIMESTAMP_END for resolutions HOUR, MINUTE
+        # Determine requested output type
+        if output_type is TimeseriesOutputType.PANDAS:
+            output = _output_df(working_directory, output_name, query_info, metadata_store, first_timestamp, last_timestamp,
+                                temporal_resolution)
+            if cleanup:
+                # There will be no output data left
+                output.output_path = None
+        elif output_type is TimeseriesOutputType.HDF:
+            output = _output_hdf(working_directory, output_name, query_info, metadata_store, first_timestamp, last_timestamp,
+                                 temporal_resolution)
+        else:
+            raise NotImplemented
 
-        # Fill the data dataframe
-        for synthesized_variable_name in metadata_store.keys():
-            num_records = metadata_store[synthesized_variable_name]['records']
-            if num_records == 0:
-                continue
-            file_path = os.path.join(temp_wd, f'{synthesized_variable_name}.json')
-            with open(file_path, mode='r') as f:
-                result_dict = json.load(f)
-                pd_series = pd.Series(result_dict, name=synthesized_variable_name)
-                output_df = output_df.join(pd_series)
-                logger.info(f'Added variable {synthesized_variable_name} with {num_records} records.')
+        return output
+    finally:
+        # Clean up
+        if cleanup:
+            # This is a temporary directory and
+            # should be cleaned up
+            shutil.rmtree(os.path.join(intermediate_directory))
 
-        # generate the metadata_data_df -- only keep metadata info with data
-        # create a pd.Series of data column names
-        synthesized_var_list = list(output_df.columns)
-        metadata_fields_list = list(metadata_store[synthesized_var_list[-1]].keys())  # don't use first TIMESTAMP column
-        empty_list = [None] * len(metadata_fields_list)
-        metadata_fields = pd.Series(empty_list, index=metadata_fields_list)
-        metadata_data_df = pd.DataFrame({'TIMESTAMP': metadata_fields})
-        for synthesized_var in synthesized_var_list:
-            if synthesized_var == 'TIMESTAMP':
-                continue
-            metadata_data_df = metadata_data_df.join(pd.Series(empty_list, name=synthesized_var))
+        # This is a temp directory and not output was saved.
+        if not output_path and not output.output_path:
+            shutil.rmtree(working_directory)
 
-        synthesized_var_with_data = []
-        synthesized_var_no_data = []
-        for synthesized_var in metadata_store.keys():
-            if synthesized_var not in synthesized_var_list:
-                synthesized_var_no_data.append(synthesized_var)
-                continue
-            synthesized_var_with_data.append(synthesized_var)
-            synthesized_var_metadata = metadata_store[synthesized_var]
-            synthesized_var_metadata_list = [synthesized_var_metadata[key] for key in metadata_fields_list]
-            metadata_data_df[synthesized_var] = pd.array(synthesized_var_metadata_list)
 
-        if len(synthesized_var_with_data) + len(synthesized_var_no_data) != len(metadata_store):
-            logger.warning(f'Metadata records mismatch. Please take a look')
+def _output_df(output_directory, output_name, query_info, metadata_store, first_timestamp, last_timestamp, temporal_resolution) -> \
+        PandasTimeseriesData:
+    """
+    Output timeseries data as a pandas data frame
 
-        if not all(output_df.columns == metadata_data_df.columns):
-            logger.warning(f'Data and metadata data frames columns do not match!')
+    :param output_directory: directory that the query results are written to
+    :param output_name: name to give output file. if None, output name will be timestamp (%Y%m%dT%H%M%S)
+    :param query_info: The query information
+    :param metadata_store: dictionary of all metadata for query
+    :param first_timestamp: datetime for the first observation of all data
+    :param last_timestamp: datetime for the last observation of all data
+    :param temporal_resolution: timescale (e.g. DAY)
+    :return: The synthesized time series data
+    """
+    # Prep the data dataframe
+    time_index = pd.date_range(first_timestamp, last_timestamp,
+                               freq=TimeFrequency.PANDAS_FREQUENCY_MAP[temporal_resolution])
+    time_series = pd.Series(time_index, index=time_index)
+    output_df = pd.DataFrame({'TIMESTAMP': time_series})
+    # ToDo: expand to have TIMESTAMP_START and TIMESTAMP_END for resolutions HOUR, MINUTE
+    # Fill the data dataframe
+    for synthesized_variable_name, result_dict in _result_generator(os.path.join(output_directory,output_name),
+                                                                    metadata_store):
+        num_records = metadata_store[synthesized_variable_name]['records']
+        pd_series = pd.Series(result_dict, name=synthesized_variable_name)
+        output_df = output_df.join(pd_series)
+        logger.info(f'Added variable {synthesized_variable_name} with {num_records} records.')
 
-    return SynthesizedTimeseriesData(output_df, metadata_store, metadata_data_df, synthesized_var_with_data, synthesized_var_no_data)
+    # generate the metadata -- only separate metadata info with data
+    # from metadata without metadata
+    synthesized_var_list = list(output_df.columns)
+    synthesized_no_var_list = list(set(metadata_store.keys()).difference(set(synthesized_var_list)))
+
+    metadata_data_df = _fill_metadata_df(metadata_store, synthesized_var_list)
+    metadata_nodata_df = _fill_metadata_df(metadata_store, synthesized_no_var_list)
+
+    if len(list(metadata_data_df.columns)) + len(list(metadata_nodata_df.columns)) - 2 != len(metadata_store):
+        logger.warning(f'Metadata records mismatch. Please take a look')
+
+    if not all(output_df.columns == metadata_data_df.columns):
+        logger.warning(f'Data and metadata data frames columns do not match!')
+
+    return PandasTimeseriesData(data=output_df, metadata=metadata_data_df, metadata_no_observations=metadata_nodata_df,
+                                output_path=output_directory,
+                                query=query_info)
+
+
+def _output_hdf(output_directory: str, output_name: str, query_info: QueryInfo, metadata_store: dict, first_timestamp, last_timestamp,
+                temporal_resolution) -> \
+        SynthesizedTimeseriesData:
+    """
+    [Unoptimized] output time series data to HDF from the pandas result.
+
+    :param output_directory: directory that the query results are written to
+    :param output_name: name to give output file. if None, output name will be timestamp (%Y%m%dT%H%M%S)
+    :param query_info: The query information
+    :param metadata_store: dictionary of all metadata for query
+    :param first_timestamp: datetime for the first observation of all data
+    :param last_timestamp: datetime for the last observation of all data
+    :param temporal_resolution: timescale (e.g. DAY)
+    :return: The synthesized time series data
+    """
+
+    pandas_result: PandasTimeseriesData = _output_df(output_directory, output_name, query_info, metadata_store,
+                                                     first_timestamp, last_timestamp,
+                                                     temporal_resolution)
+
+    # Write the data frames to the specified hdf5 file
+    filename = os.path.join(output_directory, f"{output_name}.h5")
+
+    if isinstance(pandas_result, PandasTimeseriesData):
+        # Metadata with observations
+        metadata_transpose = _transpose_metadata_df(pandas_result.metadata)
+        metadata_transpose.to_hdf(filename, key='metadata', mode='w')
+
+        # Metadata with no observations
+        metadata_transpose = _transpose_metadata_df(pandas_result.metadata_no_observations)
+        metadata_transpose.to_hdf(filename, key='metadata_no_observations', mode='a')
+
+        pandas_result.data.to_hdf(filename, key='data', mode='a')
+
+    # Now append the attributes about the query to the file
+    with h5py.File(filename, 'a') as f:
+        f['metadata'].attrs['column_names'] = list(pandas_result.metadata.columns)
+        f['metadata_no_observations'].attrs['column_names'] = list(pandas_result.metadata_no_observations.columns)
+        for field in pandas_result.query.parameters.keys():
+            f.attrs[field] = pandas_result.query.parameters[field]
+        f.attrs['query_start_time'] = pandas_result.query.start_time.isoformat()
+        f.attrs[
+            'query_end_time'] = pandas_result.query.end_time and pandas_result.query.end_time.isoformat()
+        f.attrs['variables_data'] = pandas_result.variables
+        f.attrs['variables_nodata'] = pandas_result.variables_no_observations
+    f.close()
+
+    return HDFTimeseriesData(hdf=h5py.File(filename, 'r'),
+                             output_path=output_directory,
+                             query=query_info)
+
+
+def _transpose_metadata_df(metadata_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transpose the metedata dataframe for HDF file with the specified metadata
+
+    :param metadata_df: the metadata to transpose
+    :return: The transposed data frame
+
+    """
+    # Transpose the metadata returned.  This is because HDF5 does not like columns
+    #  that are of mixed type. So columns are the metadata (e.g data_start, basin_3d_variable)
+    #  and row indices are the site/variables (e.g. USGS-02041000__RDC)
+    metadata_transpose = metadata_df.T
+    # Now convert columns with object type to string.  H5 does not like object
+    #  type columns. Due to the fact that string data types have variable length, it is by
+    #  default stored as object dtype which will need to be converted in the data frame
+    columns = list(metadata_transpose.select_dtypes(include=['object']).columns)
+    for c in columns:
+        # which will by default set the length to the max len it encounters
+        metadata_transpose[c] = metadata_transpose[c].astype(h5py.string_dtype(encoding='utf-8'))
+    return metadata_transpose
+
+
+def _fill_metadata_df(metadata_store, synthesized_variables) -> pd.DataFrame:
+    """
+    Fill the metadata dataframe for the given synthesized variables. Returns an empty dataframe, if
+    the list is empty
+
+    :param metadata_store: dictionary of all metadata for query
+    :param synthesized_variables: list of synthesized variable names
+    :return: The filled data frame
+    """
+    if not synthesized_variables:
+        # Return an empty dataframe
+        return pd.DataFrame({'TIMESTAMP': []})
+
+    metadata_fields_list = list(metadata_store[synthesized_variables[-1]].keys())  # don't use first TIMESTAMP column
+    empty_list = [None] * len(metadata_fields_list)
+    metadata_fields = pd.Series(empty_list, index=metadata_fields_list)
+    metadata_df = pd.DataFrame({'TIMESTAMP': metadata_fields})
+
+    for synthesized_var in synthesized_variables:
+        if synthesized_var == 'TIMESTAMP':
+            continue
+        metadata_df = metadata_df.join(pd.Series(empty_list, name=synthesized_var))
+        synthesized_var_metadata = metadata_store[synthesized_var]
+        synthesized_var_metadata_list = [synthesized_var_metadata[key] for key in metadata_fields_list]
+        metadata_df[synthesized_var] = pd.array(synthesized_var_metadata_list)
+    return metadata_df
+
+
+def _result_generator(output_directory: str, metadata_store: dict) -> Generator[tuple, None, None]:
+    """
+    Generator for the result data. This yields a tuple with the synthesized variable name and
+    the results in JSON.
+
+    :param output_directory: directory that the query results are written to
+    :param metadata_store: dictionary of all metadata for query
+    """
+    for synthesized_variable_name in metadata_store.keys():
+        num_records = metadata_store[synthesized_variable_name]['records']
+        if num_records == 0:
+            continue
+        file_path = os.path.join(output_directory, f'{synthesized_variable_name}.json')
+        with open(file_path, mode='r') as f:
+            yield synthesized_variable_name, json.load(f)
