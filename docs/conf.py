@@ -1,4 +1,5 @@
 from PSphinxTheme import utils
+
 # Configuration file for the Sphinx documentation builder.
 #
 # This file only contains a selection of the most common options. For a full
@@ -51,6 +52,7 @@ extensions = [
     'sphinx.ext.githubpages',
     'sphinx.ext.inheritance_diagram',
     'sphinx.ext.graphviz',
+    'sphinx_rtd_theme'
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -74,15 +76,15 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # a list of builtin themes.
 #
 # ---sphinx-themes-----
-html_theme = 'p-main_theme'
+html_theme = 'sphinx_rtd_theme'
 
 html_sidebars = {'**': ['globaltoc.html',
                         'relations.html',
                         'sourcelink.html',
                         'searchbox.html']}
 
-p, html_theme, needs_sphinx = utils.set_psphinxtheme(html_theme)
-html_theme_path = p
+# p, html_theme, needs_sphinx = utils.set_psphinxtheme(html_theme)
+html_theme_path = ["_themes", ]
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
